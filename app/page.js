@@ -15,7 +15,7 @@ import {
 import { clasificarHojaMm } from "../lib/formatosHoja";
 import { generarReportePorArea, generarReporteConsolidadoGlobal, generarReporteActividadDiaPDF } from "../lib/exportarReporte";
 import { generarReporteExcelPorArea, generarListaSeparadoresExcel, generarListaGeneralExcel, generarListaMaterialImpresion } from "../lib/exportarExcel";
-import { generarIndiceGeneralWord, generarListaPlanosWord } from "../lib/exportarWord";
+import { generarIndiceGeneralWord, generarListaPlanosWord, esCarpetaDeListaPlanos } from "../lib/exportarWord";
 import { LOGO_PUNO_BASE64 } from "../lib/logoPuno";
 import { FOTO_UROS_BASE64 } from "../lib/fotoUros";
 import { FONDO_COLEGIO_BASE64 } from "../lib/fondoColegio";
@@ -480,7 +480,7 @@ export default function Page() {
       const carpetasListas = await analizarFormatosPendientes(
         carpetasDelArea,
         setProgresoPlanos,
-        (c) => /PLANO/i.test(c.ruta || ""),
+        (c) => esCarpetaDeListaPlanos(c.ruta),
         true
       );
       setProgresoPlanos(null);
