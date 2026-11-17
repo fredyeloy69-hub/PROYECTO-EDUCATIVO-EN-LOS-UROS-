@@ -393,7 +393,7 @@ export default function Page() {
         if (
           a.tipo === "pdf" &&
           a.id &&
-          (!a.formatos || analizadoConMetodoViejoConRaros || (conRotulo && a.vRotulo == null)) &&
+          (!a.formatos || analizadoConMetodoViejoConRaros || (conRotulo && (a.vRotulo || 0) < 2)) &&
           (a.size == null || a.size <= LIMITE_BYTES) &&
           (!a.errorFormato || /demasiado/.test(a.errorFormato)) // los errores permanentes (dañado, protegido) no se reintentan
         ) {
