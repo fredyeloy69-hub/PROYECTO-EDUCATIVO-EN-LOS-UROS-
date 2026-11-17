@@ -375,7 +375,8 @@ export default function Page() {
   // con los datos de formato ya mezclados. Si algo falla, esos PDFs quedan
   // con la detección por nombre (como funcionaba antes).
   // soloCarpeta (opcional): filtro para analizar solo ciertas carpetas.
-  async function analizarFormatosPendientes(carpetasDelArea, setProgreso, soloCarpeta = null) {
+  // conRotulo: además lee el rótulo de los planos (N° de lámina, plano, bloque).
+  async function analizarFormatosPendientes(carpetasDelArea, setProgreso, soloCarpeta = null, conRotulo = false) {
     const LIMITE_BYTES = 200 * 1024 * 1024; // PDFs de hasta 200 MB
     const UMBRAL_GRANDE = 10 * 1024 * 1024; // los PDFs grandes se analizan de a uno (para no saturar el servidor)
     const pendientes = [];
@@ -392,7 +393,7 @@ export default function Page() {
         if (
           a.tipo === "pdf" &&
           a.id &&
-          (!a.formatos || analizadoConMetodoViejoConRaros) &&
+          (!a.formatos || analizadoConMetodoViejoConRaros || (conRotulo && a.vRotulo == null)) &&
           (a.size == null || a.size <= LIMITE_BYTES) &&
           (!a.errorFormato || /demasiado/.test(a.errorFormato)) // los errores permanentes (dañado, protegido) no se reintentan
         ) {
@@ -416,7 +417,7 @@ export default function Page() {
           const resp = await fetch("/api/analizar-formatos", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ items: tanda.map(({ carpetaId, fileId }) => ({ carpetaId, fileId })) }),
+            body: JSON.stringify({ items: tanda.map(({ carpetaId, fileId }) => ({ carpetaId, fileId })), conRotulo }),
           });
           const data = await resp.json();
           if (data && data.ok && data.resultados) {
@@ -479,7 +480,8 @@ export default function Page() {
       const carpetasListas = await analizarFormatosPendientes(
         carpetasDelArea,
         setProgresoPlanos,
-        (c) => /PLANO/i.test(c.ruta || "")
+        (c) => /PLANO/i.test(c.ruta || ""),
+        true
       );
       setProgresoPlanos(null);
       const resumen = await generarListaPlanosWord(areaNombre, carpetasListas);
