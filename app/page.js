@@ -15,6 +15,7 @@ import {
 import { clasificarHojaMm } from "../lib/formatosHoja";
 import { generarReportePorArea, generarReporteConsolidadoGlobal, generarReporteActividadDiaPDF } from "../lib/exportarReporte";
 import { generarReporteExcelPorArea, generarListaSeparadoresExcel, generarListaGeneralExcel, generarListaMaterialImpresion } from "../lib/exportarExcel";
+import { generarIndiceGeneralWord, generarListaPlanosWord } from "../lib/exportarWord";
 import { LOGO_PUNO_BASE64 } from "../lib/logoPuno";
 import { FOTO_UROS_BASE64 } from "../lib/fotoUros";
 import { FONDO_COLEGIO_BASE64 } from "../lib/fondoColegio";
@@ -222,6 +223,9 @@ export default function Page() {
   const [exportandoSeparadores, setExportandoSeparadores] = useState(null);
   const [menuListaGeneralAbierto, setMenuListaGeneralAbierto] = useState(false);
   const [exportandoListaGeneral, setExportandoListaGeneral] = useState(null);
+  const [menuPlanosAbierto, setMenuPlanosAbierto] = useState(false);
+  const [exportandoPlanos, setExportandoPlanos] = useState(null);
+  const [progresoPlanos, setProgresoPlanos] = useState(null); // { hechos, total } mientras se miden los PDFs de planos
   const [exportandoGlobal, setExportandoGlobal] = useState(false);
   const [modoPresentacion, setModoPresentacion] = useState(false);
   const [slidePresentacion, setSlidePresentacion] = useState(0);
@@ -345,15 +349,18 @@ export default function Page() {
 
   // Lista general (índice general de la documentación, con columna de
   // archivadores): igual que separadores, usa TODAS las carpetas del área.
-  async function handleExportarListaGeneral(areaNombre, carpetasDelArea) {
+  // formato: "word" (por defecto, para pegar en los informes) o "excel".
+  async function handleExportarListaGeneral(areaNombre, carpetasDelArea, formato = "word") {
     setExportandoListaGeneral(areaNombre);
     setMenuListaGeneralAbierto(false);
     try {
       const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error("Tiempo de espera agotado al generar el Excel")), 10000)
+        setTimeout(() => reject(new Error(`Tiempo de espera agotado al generar el ${formato === "excel" ? "Excel" : "Word"}`)), 10000)
       );
       await Promise.race([
-        generarListaGeneralExcel(areaNombre, carpetasDelArea),
+        formato === "excel"
+          ? generarListaGeneralExcel(areaNombre, carpetasDelArea)
+          : generarIndiceGeneralWord(areaNombre, carpetasDelArea),
         timeoutPromise,
       ]);
     } catch (err) {
@@ -361,6 +368,76 @@ export default function Page() {
     } finally {
       setExportandoListaGeneral(null);
     }
+  }
+
+  // Mide el tamaño REAL de hoja (A4..A0) de los PDFs que aún no fueron
+  // analizados, por tandas, vía /api/analizar-formatos. Devuelve las carpetas
+  // con los datos de formato ya mezclados. Si algo falla, esos PDFs quedan
+  // con la detección por nombre (como funcionaba antes).
+  // soloCarpeta (opcional): filtro para analizar solo ciertas carpetas.
+  async function analizarFormatosPendientes(carpetasDelArea, setProgreso, soloCarpeta = null) {
+    const LIMITE_BYTES = 200 * 1024 * 1024; // PDFs de hasta 200 MB
+    const UMBRAL_GRANDE = 10 * 1024 * 1024; // los PDFs grandes se analizan de a uno (para no saturar el servidor)
+    const pendientes = [];
+    for (const c of carpetasDelArea) {
+      if (soloCarpeta && !soloCarpeta(c)) continue;
+      for (const a of c.archivos || []) {
+        const analizadoConMetodoViejoConRaros =
+          a.tipo === "pdf" &&
+          a.formatos &&
+          a.vFormato !== 4 &&
+          (Array.isArray(a.tamanos)
+            ? a.tamanos.some((t) => !clasificarHojaMm(t.mm[0], t.mm[1]).exacto)
+            : Array.isArray(a.aprox) && a.aprox.length > 0);
+        if (
+          a.tipo === "pdf" &&
+          a.id &&
+          (!a.formatos || analizadoConMetodoViejoConRaros) &&
+          (a.size == null || a.size <= LIMITE_BYTES) &&
+          (!a.errorFormato || /demasiado/.test(a.errorFormato)) // los errores permanentes (dañado, protegido) no se reintentan
+        ) {
+          pendientes.push({ carpetaId: c.id, fileId: a.id, grande: !!(a.size && a.size > UMBRAL_GRANDE) });
+        }
+      }
+    }
+    const analizados = {};
+    if (pendientes.length > 0) {
+      const TANDA = 8;
+      // Primero los PDFs normales en tandas de 8; los grandes (>10 MB) uno por uno.
+      const normales = pendientes.filter((p) => !p.grande);
+      const grandes = pendientes.filter((p) => p.grande);
+      const tandas = [];
+      for (let i = 0; i < normales.length; i += TANDA) tandas.push(normales.slice(i, i + TANDA));
+      for (const g of grandes) tandas.push([g]);
+      let hechos = 0;
+      for (const tanda of tandas) {
+        setProgreso({ hechos, total: pendientes.length, grande: tanda.length === 1 && tanda[0].grande });
+        try {
+          const resp = await fetch("/api/analizar-formatos", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ items: tanda.map(({ carpetaId, fileId }) => ({ carpetaId, fileId })) }),
+          });
+          const data = await resp.json();
+          if (data && data.ok && data.resultados) {
+            for (const [fileId, r] of Object.entries(data.resultados)) {
+              if (!r) continue;
+              if (r.error) analizados[fileId] = { errorFormato: r.error };
+              else analizados[fileId] = { ...r, errorFormato: null };
+            }
+          }
+        } catch {
+          // se sigue con la siguiente tanda; los que fallen usarán el nombre
+        }
+        hechos += tanda.length;
+      }
+    }
+
+    if (Object.keys(analizados).length === 0) return carpetasDelArea;
+    return carpetasDelArea.map((c) => ({
+      ...c,
+      archivos: (c.archivos || []).map((a) => (analizados[a.id] ? { ...a, ...analizados[a.id] } : a)),
+    }));
   }
 
   // Material de impresión: cuenta hojas A4/A3/A2/A1/A0, siempre con TODAS
@@ -371,72 +448,9 @@ export default function Page() {
     setProgresoMaterial(null);
     try {
       // 1) Detectar el formato REAL (por tamaño de hoja) de los PDFs que aún no
-      //    fueron analizados. Se hace por tandas; si algo falla, esos PDFs
-      //    quedan con la detección por nombre (como funcionaba antes).
-      const LIMITE_BYTES = 200 * 1024 * 1024; // PDFs de hasta 200 MB
-      const UMBRAL_GRANDE = 10 * 1024 * 1024; // los PDFs grandes se analizan de a uno (para no saturar el servidor)
-      const pendientes = [];
-      for (const c of carpetasDelArea) {
-        for (const a of c.archivos || []) {
-          const analizadoConMetodoViejoConRaros =
-            a.tipo === "pdf" &&
-            a.formatos &&
-            a.vFormato !== 4 &&
-            (Array.isArray(a.tamanos)
-              ? a.tamanos.some((t) => !clasificarHojaMm(t.mm[0], t.mm[1]).exacto)
-              : Array.isArray(a.aprox) && a.aprox.length > 0);
-          if (
-            a.tipo === "pdf" &&
-            a.id &&
-            (!a.formatos || analizadoConMetodoViejoConRaros) &&
-            (a.size == null || a.size <= LIMITE_BYTES) &&
-            (!a.errorFormato || /demasiado/.test(a.errorFormato)) // los errores permanentes (dañado, protegido) no se reintentan
-          ) {
-            pendientes.push({ carpetaId: c.id, fileId: a.id, grande: !!(a.size && a.size > UMBRAL_GRANDE) });
-          }
-        }
-      }
-      const analizados = {};
-      if (pendientes.length > 0) {
-        const TANDA = 8;
-        // Primero los PDFs normales en tandas de 8; los grandes (>10 MB) uno por uno.
-        const normales = pendientes.filter((p) => !p.grande);
-        const grandes = pendientes.filter((p) => p.grande);
-        const tandas = [];
-        for (let i = 0; i < normales.length; i += TANDA) tandas.push(normales.slice(i, i + TANDA));
-        for (const g of grandes) tandas.push([g]);
-        let hechos = 0;
-        for (const tanda of tandas) {
-          setProgresoMaterial({ hechos, total: pendientes.length, grande: tanda.length === 1 && tanda[0].grande });
-          try {
-            const resp = await fetch("/api/analizar-formatos", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ items: tanda.map(({ carpetaId, fileId }) => ({ carpetaId, fileId })) }),
-            });
-            const data = await resp.json();
-            if (data && data.ok && data.resultados) {
-              for (const [fileId, r] of Object.entries(data.resultados)) {
-                if (!r) continue;
-                if (r.error) analizados[fileId] = { errorFormato: r.error };
-                else analizados[fileId] = { ...r, errorFormato: null };
-              }
-            }
-          } catch {
-            // se sigue con la siguiente tanda; los que fallen usarán el nombre
-          }
-          hechos += tanda.length;
-        }
-      }
+      //    fueron analizados (ver analizarFormatosPendientes).
+      const carpetasListas = await analizarFormatosPendientes(carpetasDelArea, setProgresoMaterial);
       setProgresoMaterial(null);
-
-      const carpetasListas =
-        Object.keys(analizados).length === 0
-          ? carpetasDelArea
-          : carpetasDelArea.map((c) => ({
-              ...c,
-              archivos: (c.archivos || []).map((a) => (analizados[a.id] ? { ...a, ...analizados[a.id] } : a)),
-            }));
 
       // 2) Generar el Excel
       const timeoutPromise = new Promise((_, reject) =>
@@ -451,6 +465,38 @@ export default function Page() {
     } finally {
       setProgresoMaterial(null);
       setExportandoMaterial(null);
+    }
+  }
+
+  // Relación de planos (Word): una tabla por especialidad con ORDEN, CÓDIGO,
+  // NOMBRE, N° DE LÁMINA y FORMATO. El formato sale del tamaño real del PDF,
+  // por eso primero se miden los PDFs de planos que aún no se analizaron.
+  async function handleExportarListaPlanos(areaNombre, carpetasDelArea) {
+    setExportandoPlanos(areaNombre);
+    setMenuPlanosAbierto(false);
+    setProgresoPlanos(null);
+    try {
+      const carpetasListas = await analizarFormatosPendientes(
+        carpetasDelArea,
+        setProgresoPlanos,
+        (c) => /PLANO/i.test(c.ruta || "")
+      );
+      setProgresoPlanos(null);
+      const resumen = await generarListaPlanosWord(areaNombre, carpetasListas);
+      if (resumen.totalPlanos === 0) {
+        alert(`No se encontraron PDFs dentro de carpetas de PLANOS en "${areaNombre}".`);
+      } else if (resumen.avisos.length > 0) {
+        const lista = resumen.avisos.slice(0, 15).map((a) => `• ${a}`).join("\n");
+        const mas = resumen.avisos.length > 15 ? `\n… y ${resumen.avisos.length - 15} más` : "";
+        alert(
+          `Relación de planos generada: ${resumen.totalPlanos} planos en ${resumen.totalEspecialidades} especialidad(es).\n\nRevisa estos casos en el Word:\n${lista}${mas}`
+        );
+      }
+    } catch (err) {
+      alert(`No se pudo generar la relación de planos: ${err.message}`);
+    } finally {
+      setProgresoPlanos(null);
+      setExportandoPlanos(null);
     }
   }
 
@@ -1073,7 +1119,7 @@ export default function Page() {
                   boxShadow: "0 0 16px rgba(63,127,191,.35)",
                   letterSpacing: 0.2,
                 }}
-                title="Genera el índice general de la documentación, con columna de N° de archivadores para completar a mano"
+                title="Índice general de la documentación en Word (separado por especialidad, con jerarquía) — o en Excel con columna de N° de archivadores"
               >
                 <span style={{ fontSize: 16 }}>📑</span>
                 EXPORTAR LISTA GENERAL
@@ -1096,13 +1142,109 @@ export default function Page() {
                   }}
                 >
                   <div style={{ padding: "9px 14px", fontSize: 11, fontWeight: 700, color: "#F7C6D6", borderBottom: "1px solid #C4456E55", textTransform: "uppercase", letterSpacing: 0.5 }}>
-                    Elige la carpeta madre
+                    Elige la carpeta madre · Word (o XLSX)
+                  </div>
+                  {areas.map((a) => (
+                    <div key={a} style={{ display: "flex", alignItems: "stretch", borderBottom: "1px solid #C4456E22" }}>
+                      <button
+                        onClick={() => handleExportarListaGeneral(a, carpetasPorArea[a] || [], "word")}
+                        disabled={exportandoListaGeneral === a}
+                        style={{
+                          flex: 1,
+                          textAlign: "left",
+                          padding: "11px 14px",
+                          fontSize: 13,
+                          fontWeight: 600,
+                          background: "transparent",
+                          border: "none",
+                          color: exportandoListaGeneral === a ? "#8A4A62" : "#F7C6D6",
+                          cursor: exportandoListaGeneral === a ? "not-allowed" : "pointer",
+                        }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "#C4456E22")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                        title="Índice en Word, separado por especialidad, con jerarquía y tabulación — para pegar en los informes"
+                      >
+                        📝 {exportandoListaGeneral === a ? `Generando ${a}...` : a}
+                      </button>
+                      <button
+                        onClick={() => handleExportarListaGeneral(a, carpetasPorArea[a] || [], "excel")}
+                        disabled={exportandoListaGeneral === a}
+                        style={{
+                          padding: "0 12px",
+                          fontSize: 11,
+                          fontWeight: 700,
+                          background: "transparent",
+                          border: "none",
+                          borderLeft: "1px solid #C4456E33",
+                          color: "#C98AA0",
+                          cursor: exportandoListaGeneral === a ? "not-allowed" : "pointer",
+                        }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "#C4456E22")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                        title="Versión Excel (con columna de N° de archivadores)"
+                      >
+                        XLSX
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* BOTÓN — Relación de planos en Word (turquesa, tono lago) */}
+            <div style={{ position: "relative" }}>
+              <button
+                onClick={() => setMenuPlanosAbierto((v) => !v)}
+                style={{
+                  fontSize: 13,
+                  fontWeight: 800,
+                  padding: "14px 15px",
+                  borderRadius: 14,
+                  border: "2px solid #3FC1C9",
+                  background: "linear-gradient(135deg,#0B3236,#0C2B4A)",
+                  color: "#C6F1F3",
+                  cursor: "pointer",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  whiteSpace: "nowrap",
+                  boxShadow: "0 0 16px rgba(63,193,201,.35)",
+                  letterSpacing: 0.2,
+                }}
+                title="Relación de planos en Word: una tabla por especialidad (ORDEN, CÓDIGO, NOMBRE DE PLANO, N° DE LÁMINA, FORMATO)"
+              >
+                <span style={{ fontSize: 16 }}>📐</span>
+                {exportandoPlanos
+                  ? progresoPlanos
+                    ? `MIDIENDO PLANOS ${Math.min(progresoPlanos.hechos + 1, progresoPlanos.total)}/${progresoPlanos.total}${progresoPlanos.grande ? " (PDF grande)" : ""}...`
+                    : "GENERANDO..."
+                  : "EXPORTAR LISTA DE PLANOS"}
+                <span style={{ fontSize: 11, opacity: 0.8 }}>{menuPlanosAbierto ? "▲" : "▼"}</span>
+              </button>
+
+              {menuPlanosAbierto && (
+                <div
+                  style={{
+                    position: "absolute",
+                    top: "calc(100% + 6px)",
+                    left: 0,
+                    zIndex: 50,
+                    background: "#082427",
+                    border: "2px solid #3FC1C9",
+                    borderRadius: 12,
+                    minWidth: 260,
+                    boxShadow: "0 8px 24px rgba(0,0,0,.5)",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div style={{ padding: "9px 14px", fontSize: 11, fontWeight: 700, color: "#C6F1F3", borderBottom: "1px solid #3FC1C955", textTransform: "uppercase", letterSpacing: 0.5 }}>
+                    Elige la carpeta madre · Word
                   </div>
                   {areas.map((a) => (
                     <button
                       key={a}
-                      onClick={() => handleExportarListaGeneral(a, carpetasPorArea[a] || [])}
-                      disabled={exportandoListaGeneral === a}
+                      onClick={() => handleExportarListaPlanos(a, carpetasPorArea[a] || [])}
+                      disabled={!!exportandoPlanos}
                       style={{
                         display: "block",
                         width: "100%",
@@ -1112,14 +1254,14 @@ export default function Page() {
                         fontWeight: 600,
                         background: "transparent",
                         border: "none",
-                        borderBottom: "1px solid #C4456E22",
-                        color: exportandoListaGeneral === a ? "#8A4A62" : "#F7C6D6",
-                        cursor: exportandoListaGeneral === a ? "not-allowed" : "pointer",
+                        borderBottom: "1px solid #3FC1C922",
+                        color: exportandoPlanos === a ? "#3E7F84" : "#C6F1F3",
+                        cursor: exportandoPlanos ? "not-allowed" : "pointer",
                       }}
-                      onMouseEnter={(e) => (e.currentTarget.style.background = "#C4456E22")}
+                      onMouseEnter={(e) => (e.currentTarget.style.background = "#3FC1C922")}
                       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
                     >
-                      📊 {exportandoListaGeneral === a ? `Generando ${a}...` : a}
+                      📐 {exportandoPlanos === a ? `Generando ${a}...` : a}
                     </button>
                   ))}
                 </div>
