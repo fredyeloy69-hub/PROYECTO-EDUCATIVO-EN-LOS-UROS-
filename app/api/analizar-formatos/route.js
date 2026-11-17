@@ -19,11 +19,12 @@ function conTiempoMaximo(promesa, ms) {
 // Solo analiza PDFs que YA están registrados en Firestore (colección
 // "carpetas") — no se puede pedir analizar un archivo cualquiera de Drive.
 //
-// Body: { items: [{ carpetaId, fileId }, ...] }  (máx. 8 por llamada)
+// Body: { items: [{ carpetaId, fileId }, ...], conRotulo?: true }  (máx. 8 por llamada)
+// conRotulo: además lee el rótulo de cada hoja (N° de lámina, plano, bloque).
 // Respuesta: { ok, resultados: { [fileId]: { paginas, formatos, aprox } | { error } | null } }
 export async function POST(request) {
   try {
-    const { items } = await request.json();
+    const { items, conRotulo } = await request.json();
     if (!Array.isArray(items) || items.length === 0) {
       return NextResponse.json({ ok: false, error: "Falta items" }, { status: 400 });
     }
@@ -51,7 +52,7 @@ export async function POST(request) {
     const tiempo = validos.length === 1 ? TIMEOUT_PDF_SOLO_MS : TIMEOUT_PDF_MS;
     await Promise.all(
       validos.map(async (p) => {
-        resultados[p.fileId] = await conTiempoMaximo(analizarPdf(p.fileId, tiempo - 2000), tiempo);
+        resultados[p.fileId] = await conTiempoMaximo(analizarPdf(p.fileId, tiempo - 2000, { conRotulo: !!conRotulo }), tiempo);
       })
     );
 
@@ -64,7 +65,8 @@ export async function POST(request) {
       d.archivos = d.archivos.map((a) => {
         if (a.id !== p.fileId) return a;
         if (r.error) return { ...a, errorFormato: r.error };
-        return { ...a, paginas: r.paginas, formatos: r.formatos, aprox: r.aprox || null, tamanos: r.tamanos || null, vFormato: r.v || 4, errorFormato: null };
+        const rotulo = r.vRotulo ? { rotulos: r.rotulos || null, vRotulo: r.vRotulo } : {};
+        return { ...a, paginas: r.paginas, formatos: r.formatos, aprox: r.aprox || null, tamanos: r.tamanos || null, vFormato: r.v || 4, errorFormato: null, ...rotulo };
       });
       carpetasConCambios.add(p.carpetaId);
     }
